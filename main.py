@@ -5,16 +5,18 @@ from flask import Flask
 from threading import Thread
 from config import Config
 
-# --- RENDER KEEP-ALIVE TRICK ---
+# --- RENDER HEARTBEAT (Keep-Alive) ---
 app = Flask('')
 @app.route('/')
 def home(): return "Bot is Online"
 
 def run_heartbeat():
+    # Render uses port 10000 by default
     app.run(host='0.0.0.0', port=10000)
 
 def keep_alive():
     t = Thread(target=run_heartbeat)
+    t.daemon = True
     t.start()
 
 class MarketIntel:
@@ -58,59 +60,55 @@ class SniperBot:
 
     def check_limits(self):
         now = datetime.now()
-        
-        # 1. Midnight Reset Logic
+        # Midnight Reset logic
         if now.date() > self.current_day:
-            self.log("🕛 Midnight Reset: New Daily Target active.")
+            self.log("🕛 Midnight Reset: Refreshing Daily Targets.")
             self.current_day = now.date()
             self.daily_start_bal = self.balance
             self.lock_until = None
             return True
 
-        # 2. Check if bot is in a "Time-Out"
         if self.lock_until and now < self.lock_until:
             return False
-
-        # 3. Check Daily Profit/Loss
+        
         daily_profit = self.balance - self.daily_start_bal
         if daily_profit >= Config.DAILY_TARGET:
-            self.log(f"🏆 Daily Target ${Config.DAILY_TARGET} Hit! Sleeping until Midnight.")
+            # Lock until the end of the day
             self.lock_until = now.replace(hour=23, minute=59, second=59)
             return False
-        if daily_profit <= -Config.DAILY_STOP_LOSS:
-            self.log(f"🛑 Daily Stop Loss -${Config.DAILY_STOP_LOSS} Hit! Locked.")
-            self.lock_until = now.replace(hour=23, minute=59, second=59)
-            return False
-
         return True
 
     def calculate_stake(self):
         if self.mode == "DIFFERS": return Config.BASE_STAKE
+        
         deficit = self.peak_bal - self.balance
         if deficit <= 0: return Config.BASE_STAKE
         
-        target_recovery = deficit if self.balance >= self.start_bal else deficit * 0.50
-        req_stake = round(target_recovery / 0.60, 2)
-        return min(max(req_stake, Config.MIN_STAKE), round(self.balance * 0.15, 2))
+        # Recovery Math using RECO_TARGET_PROFIT
+        target_win = deficit + Config.RECO_TARGET_PROFIT
+        req_stake = round(target_win / 0.60, 2) # Assuming 60% payout for Over/Under
+        
+        max_risk = round(self.balance * 0.15, 2)
+        return min(max(req_stake, Config.MIN_STAKE), max_risk)
 
     async def trade(self, ws, symbol, c_type, barrier=None):
-        if not self.is_trading and self.check_limits():
-            self.is_trading = True
-            stake = self.calculate_stake()
-            payload = {
-                "buy": 1, "price": stake,
-                "parameters": {
-                    "amount": stake, "basis": "stake", "contract_type": c_type,
-                    "currency": "USD", "duration": 1, "duration_unit": "t", "symbol": symbol
-                }
+        if self.is_trading: return
+        self.is_trading = True
+        
+        stake = self.calculate_stake()
+        payload = {
+            "buy": 1, "price": stake,
+            "parameters": {
+                "amount": stake, "basis": "stake", "contract_type": c_type,
+                "currency": "USD", "duration": 1, "duration_unit": "t", "symbol": symbol
             }
-            if barrier is not None: payload["parameters"]["barrier"] = str(barrier)
-            await ws.send(json.dumps(payload))
+        }
+        if barrier is not None: payload["parameters"]["barrier"] = str(barrier)
+        await ws.send(json.dumps(payload))
 
     async def dashboard(self):
         while True:
             sys.stdout.write("\033[H")
-            stake = self.calculate_stake()
             daily_p = self.balance - self.daily_start_bal
             
             status = "🟢 ACTIVE"
@@ -119,10 +117,10 @@ class SniperBot:
 
             out = [
                 f"💰 BAL: ${self.balance:,.2f} | DAILY: ${daily_p:+.2f} | STATUS: {status}",
-                f"🎯 MODE: {self.mode:<10} | NEXT STAKE: ${stake:.2f} | PEAK: ${self.peak_bal:.2f}",
-                "━" * 105,
+                f"🎯 MODE: {self.mode:<10} | NEXT STAKE: ${self.calculate_stake():.2f} | PEAK: ${self.peak_bal:.2f}",
+                "━" * 100,
                 f"{'MARKET':<10} | L | {'KING (1000t)':<15} | {'SLAVE (1000t)':<15} | ACTION",
-                "━" * 105
+                "━" * 100
             ]
             for s, m in self.markets.items():
                 analysis = m.get_analysis()
@@ -132,14 +130,16 @@ class SniperBot:
                 pcts, king, slave = analysis
                 gap = pcts[king] - pcts[slave]
                 signal = "⚪ WAIT"
-                if not self.is_trading and status == "🟢 ACTIVE":
+                if not self.lock_until or datetime.now() >= self.lock_until:
                     if self.mode == "DIFFERS" and m.last_digit == king and m.prev_digit == king:
                         signal = "🎯 DIFFERS"
                     elif self.mode == "RECOVERY" and m.is_anti_digit(king) and gap >= Config.MIN_GAP_PERCENT:
                         signal = "🔥 RECOVER"
-                out.append(f"{Config.MARKETS[s]['name']:<10} | {m.last_digit} | {king} ({pcts[king]:.1f}%) | {slave} ({pcts[slave]:.1f}%) | {signal}")
+                
+                out.append(f"{Config.MARKETS[s]['name']:<10} | {m.last_digit} | "
+                           f"{king} ({pcts[king]:.1f}%) | {slave} ({pcts[slave]:.1f}%) | {signal}")
             
-            out.append("━" * 105 + "\n📋 LOGS:")
+            out.append("━" * 100 + "\n📋 LOGS:")
             for l in self.logs: out.append(f"   {l}")
             sys.stdout.write("\n".join(out) + "\033[J\n")
             await asyncio.sleep(0.5)
@@ -154,6 +154,7 @@ class SniperBot:
                     asyncio.create_task(self.dashboard())
                     while True:
                         data = json.loads(await ws.recv())
+                        
                         if "authorize" in data:
                             await ws.send(json.dumps({"balance": 1, "subscribe": 1}))
                             await ws.send(json.dumps({"proposal_open_contract": 1, "subscribe": 1}))
@@ -179,24 +180,31 @@ class SniperBot:
                                 profit = float(c.get('profit', 0))
                                 
                                 if self.balance > self.peak_bal: self.peak_bal = self.balance
-                                self.mode = "DIFFERS" if (is_win and self.balance >= self.start_bal) or self.balance >= self.peak_bal else "RECOVERY"
                                 
-                                # --- Session Management ---
-                                if not is_win:
-                                    self.log(f"❌ Loss! Locking for 2 hours to cool down.")
-                                    self.lock_until = datetime.now() + timedelta(hours=2)
-                                elif profit >= Config.SESSION_TAKE_PROFIT:
-                                    self.log(f"✅ Session Win ${profit}! 1-hour break.")
-                                    self.lock_until = datetime.now() + timedelta(hours=1)
+                                # Mode Switch Logic
+                                if (is_win and self.balance >= self.start_bal) or self.balance >= self.peak_bal:
+                                    self.mode = "DIFFERS"
+                                else:
+                                    self.mode = "RECOVERY"
+
+                                # Cooldown triggers
+                                now = datetime.now()
+                                daily_p = self.balance - self.daily_start_bal
                                 
-                                self.log(f"{'✅' if is_win else '❌'} Result: ${profit:+.2f} | Mode: {self.mode}")
+                                if is_win and profit >= Config.SESSION_TAKE_PROFIT:
+                                    self.log(f"✅ Session Target Hit! 2-hour break.")
+                                    self.lock_until = now + timedelta(hours=2)
+                                elif not is_win and daily_p <= -Config.STOP_LOSS_LIMIT:
+                                    self.log(f"⚠️ Stop Loss Limit Hit! 2-hour cooling.")
+                                    self.lock_until = now + timedelta(hours=2)
+
+                                self.log(f"{'✅' if is_win else '❌'} {c.get('contract_type')} | ${profit:+.2f} | Mode: {self.mode}")
                                 self.is_trading = False 
 
                         if "tick" in data and not self.is_trading and self.check_limits():
                             t_sym = data["tick"]["symbol"]
                             self.markets[t_sym].update(data["tick"]["quote"])
                             
-                            # (Market Selection logic remains exactly same as your original)
                             for s_code, m_intel in self.markets.items():
                                 analysis = m_intel.get_analysis()
                                 if not analysis: continue
