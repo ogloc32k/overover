@@ -8,17 +8,20 @@ class Config:
     APP_ID = os.getenv("APP_ID", "133069") 
     TOKEN = os.getenv("DERIV_TOKEN")
     
-    # 🎯 Trading Strategy
+    # 🎯 Tough Sniping Filters
     BASE_STAKE = 0.35
     MIN_STAKE = 0.35  
     BARRIER_UNDER = "6"
     BARRIER_OVER = "3"
     
-    # 🧠 Recovery Logic
-    MIN_GAP_PERCENT = 3.0
-    RECO_TARGET_PROFIT = 0.05  # <--- RESTORED: Ensures recovery trades cover cost + profit
+    # 🛡️ Statistical Filters (The "Toughness")
+    MIN_GAP_PERCENT = 4.5      # Increased from 3.0: Only fire on massive divergence
+    KING_MIN_PCT = 13.5        # King must represent >13.5% of last 1000 ticks
     
-    # 🛡️ Risk Management (As requested: 2-hour cooldowns)
+    # 🧠 Recovery Logic
+    RECO_TARGET_PROFIT = 0.05  
+    
+    # 🛡️ Risk Management (2-hour cooldowns)
     DAILY_TARGET = 2.00       
     SESSION_TAKE_PROFIT = 1.00 
     STOP_LOSS_LIMIT = 2.00     
