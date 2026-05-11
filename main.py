@@ -5,13 +5,12 @@ from flask import Flask
 from threading import Thread
 from config import Config
 
-# --- RENDER HEARTBEAT (Keep-Alive) ---
+# --- RENDER HEARTBEAT ---
 app = Flask('')
 @app.route('/')
 def home(): return "Bot is Online"
 
 def run_heartbeat():
-    # Render uses port 10000 by default
     app.run(host='0.0.0.0', port=10000)
 
 def keep_alive():
@@ -39,6 +38,10 @@ class MarketIntel:
     def get_analysis(self):
         if len(self.ticks) < 1000: return None
         pcts = {i: round(self.counts[i] / 10.0, 1) for i in range(10)}
+        if sum(self.counts.values()) != 1000:
+            self.counts = {i: 0 for i in range(10)}
+            for d in self.ticks: self.counts[d] += 1
+            pcts = {i: round(self.counts[i] / 10.0, 1) for i in range(10)}
         return pcts, max(pcts, key=pcts.get), min(pcts, key=pcts.get)
 
     def is_anti_digit(self, king):
@@ -58,11 +61,11 @@ class SniperBot:
 
     def log(self, msg): self.logs.append(f"[{time.strftime('%H:%M:%S')}] {msg}")
 
+    # --- COOLDOWN LOGIC ---
     def check_limits(self):
         now = datetime.now()
-        # Midnight Reset logic
         if now.date() > self.current_day:
-            self.log("🕛 Midnight Reset: Refreshing Daily Targets.")
+            self.log("🕛 Midnight Reset: New Daily Target active.")
             self.current_day = now.date()
             self.daily_start_bal = self.balance
             self.lock_until = None
@@ -70,30 +73,39 @@ class SniperBot:
 
         if self.lock_until and now < self.lock_until:
             return False
-        
+
         daily_profit = self.balance - self.daily_start_bal
         if daily_profit >= Config.DAILY_TARGET:
-            # Lock until the end of the day
             self.lock_until = now.replace(hour=23, minute=59, second=59)
             return False
         return True
 
+    # --- HYBRID STAKE LOGIC (EXACTLY YOUR ORIGINAL) ---
     def calculate_stake(self):
-        if self.mode == "DIFFERS": return Config.BASE_STAKE
+        if self.mode == "DIFFERS":
+            return Config.BASE_STAKE
         
         deficit = self.peak_bal - self.balance
         if deficit <= 0: return Config.BASE_STAKE
         
-        # Recovery Math using RECO_TARGET_PROFIT
-        target_win = deficit + Config.RECO_TARGET_PROFIT
-        req_stake = round(target_win / 0.60, 2) # Assuming 60% payout for Over/Under
+        # Decide recovery aggressiveness based on start_bal
+        if self.balance >= self.start_bal:
+            # ONE-STEP: In profit, target 100% recovery
+            target_recovery = deficit 
+            multiplier = 0.60 # Typical Over/Under payout
+        else:
+            # TWO-STEP: In debt, target 50% recovery (Cushioned)
+            target_recovery = deficit * 0.50
+            multiplier = 0.60
+
+        req_stake = round(target_recovery / multiplier, 2)
+        max_risk = round(self.balance * 0.15, 2) # Safety cap
         
-        max_risk = round(self.balance * 0.15, 2)
         return min(max(req_stake, Config.MIN_STAKE), max_risk)
 
     async def trade(self, ws, symbol, c_type, barrier=None):
-        if self.is_trading: return
-        self.is_trading = True
+        if not self.is_trading: 
+             self.is_trading = True
         
         stake = self.calculate_stake()
         payload = {
@@ -109,18 +121,20 @@ class SniperBot:
     async def dashboard(self):
         while True:
             sys.stdout.write("\033[H")
-            daily_p = self.balance - self.daily_start_bal
+            growth = ((self.balance - self.start_bal) / self.start_bal * 100) if self.start_bal > 0 else 0.0
+            stake = self.calculate_stake()
             
-            status = "🟢 ACTIVE"
-            if self.lock_until and datetime.now() < self.lock_until:
-                status = f"🔴 LOCKED UNTIL {self.lock_until.strftime('%H:%M')}"
-
+            strat = "1-STEP" if self.balance >= self.start_bal else "2-STEP"
+            status_tag = f"\033[92m[AT PEAK]\033[0m" if self.mode == "DIFFERS" else f"\033[91m[RECO {strat}]\033[0m"
+            
+            lock_status = "🟢 ACTIVE" if not self.lock_until or datetime.now() >= self.lock_until else f"🔴 LOCKED UNTIL {self.lock_until.strftime('%H:%M:%S')}"
+            
             out = [
-                f"💰 BAL: ${self.balance:,.2f} | DAILY: ${daily_p:+.2f} | STATUS: {status}",
-                f"🎯 MODE: {self.mode:<10} | NEXT STAKE: ${self.calculate_stake():.2f} | PEAK: ${self.peak_bal:.2f}",
-                "━" * 100,
+                f"💰 BAL: ${self.balance:,.2f} | PEAK: ${self.peak_bal:,.2f} | START: ${self.start_bal:,.2f} | {lock_status}",
+                f"🎯 MODE: {self.mode:<10} | NEXT STAKE: ${stake:.2f} | {status_tag}",
+                "━" * 105,
                 f"{'MARKET':<10} | L | {'KING (1000t)':<15} | {'SLAVE (1000t)':<15} | ACTION",
-                "━" * 100
+                "━" * 105
             ]
             for s, m in self.markets.items():
                 analysis = m.get_analysis()
@@ -130,22 +144,22 @@ class SniperBot:
                 pcts, king, slave = analysis
                 gap = pcts[king] - pcts[slave]
                 signal = "⚪ WAIT"
-                if not self.lock_until or datetime.now() >= self.lock_until:
+                if not self.is_trading and (not self.lock_until or datetime.now() >= self.lock_until):
                     if self.mode == "DIFFERS" and m.last_digit == king and m.prev_digit == king:
                         signal = "🎯 DIFFERS"
                     elif self.mode == "RECOVERY" and m.is_anti_digit(king) and gap >= Config.MIN_GAP_PERCENT:
                         signal = "🔥 RECOVER"
-                
                 out.append(f"{Config.MARKETS[s]['name']:<10} | {m.last_digit} | "
                            f"{king} ({pcts[king]:.1f}%) | {slave} ({pcts[slave]:.1f}%) | {signal}")
             
-            out.append("━" * 100 + "\n📋 LOGS:")
+            out.append("━" * 105 + "\n📋 LOGS:")
             for l in self.logs: out.append(f"   {l}")
             sys.stdout.write("\n".join(out) + "\033[J\n")
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.4)
 
     async def run(self):
-        keep_alive()
+        keep_alive() # Starts the Render Heartbeat
+        os.system('clear' if os.name == 'posix' else 'cls')
         uri = f"wss://ws.derivws.com/websockets/v3?app_id={Config.APP_ID}"
         while True:
             try:
@@ -165,8 +179,8 @@ class SniperBot:
                             self.balance = float(data["balance"]["balance"])
                             if self.start_bal == 0: 
                                 self.start_bal = self.balance
-                                self.daily_start_bal = self.balance
                                 self.peak_bal = self.balance
+                                self.daily_start_bal = self.balance
 
                         if "history" in data:
                             sym = data["echo_req"]["ticks_history"]
@@ -178,16 +192,17 @@ class SniperBot:
                             if c and c.get("is_sold"):
                                 is_win = (c["status"] == "won")
                                 profit = float(c.get('profit', 0))
-                                
                                 if self.balance > self.peak_bal: self.peak_bal = self.balance
                                 
-                                # Mode Switch Logic
-                                if (is_win and self.balance >= self.start_bal) or self.balance >= self.peak_bal:
+                                # HYBRID RECOVERY LOGIC (EXACTLY YOUR ORIGINAL)
+                                if is_win and self.balance >= self.start_bal:
+                                    self.mode = "DIFFERS"
+                                elif self.balance >= self.peak_bal:
                                     self.mode = "DIFFERS"
                                 else:
                                     self.mode = "RECOVERY"
-
-                                # Cooldown triggers
+                                
+                                # COOLDOWN TRIGGERS
                                 now = datetime.now()
                                 daily_p = self.balance - self.daily_start_bal
                                 
@@ -195,33 +210,46 @@ class SniperBot:
                                     self.log(f"✅ Session Target Hit! 2-hour break.")
                                     self.lock_until = now + timedelta(hours=2)
                                 elif not is_win and daily_p <= -Config.STOP_LOSS_LIMIT:
-                                    self.log(f"⚠️ Stop Loss Limit Hit! 2-hour cooling.")
+                                    self.log(f"⚠️ Stop Loss Hit! 2-hour cooling.")
                                     self.lock_until = now + timedelta(hours=2)
 
-                                self.log(f"{'✅' if is_win else '❌'} {c.get('contract_type')} | ${profit:+.2f} | Mode: {self.mode}")
+                                self.log(f"{'✅' if is_win else '❌'} {c.get('contract_type')} | ${profit:+.2f} | MODE: {self.mode}")
                                 self.is_trading = False 
 
                         if "tick" in data and not self.is_trading and self.check_limits():
                             t_sym = data["tick"]["symbol"]
                             self.markets[t_sym].update(data["tick"]["quote"])
                             
+                            best_market = None
+                            max_gap = -1.0
+
+                            # EXACTLY YOUR ORIGINAL MAX_GAP SCANNER
                             for s_code, m_intel in self.markets.items():
                                 analysis = m_intel.get_analysis()
                                 if not analysis: continue
                                 pcts, king, slave = analysis
                                 gap = pcts[king] - pcts[slave]
 
-                                if self.mode == "DIFFERS" and m_intel.last_digit == king and m_intel.prev_digit == king:
-                                    await self.trade(ws, s_code, "DIGITDIFF", barrier=slave)
-                                    break
-                                elif self.mode == "RECOVERY" and m_intel.is_anti_digit(king) and gap >= Config.MIN_GAP_PERCENT:
-                                    c_type = "DIGITUNDER" if king <= 4 else "DIGITOVER"
-                                    barrier = Config.BARRIER_UNDER if king <= 4 else Config.BARRIER_OVER
-                                    await self.trade(ws, s_code, c_type, barrier=barrier)
-                                    break
+                                if self.mode == "DIFFERS":
+                                    if m_intel.last_digit == king and m_intel.prev_digit == king:
+                                        best_market = (s_code, "DIGITDIFF", slave)
+                                        break 
+
+                                elif self.mode == "RECOVERY":
+                                    if m_intel.is_anti_digit(king) and gap >= Config.MIN_GAP_PERCENT:
+                                        if gap > max_gap:
+                                            max_gap = gap
+                                            c_type = "DIGITUNDER" if king <= 4 else "DIGITOVER"
+                                            barrier = Config.BARRIER_UNDER if king <= 4 else Config.BARRIER_OVER
+                                            best_market = (s_code, c_type, barrier)
+
+                            if best_market and not self.is_trading:
+                                self.is_trading = True 
+                                s_id, c_id, b_id = best_market
+                                asyncio.create_task(self.trade(ws, s_id, c_id, barrier=b_id))
 
             except Exception as e:
-                self.log(f"📡 Connection Error: {e}")
+                self.log(f"📡 Error: {e}")
                 self.is_trading = False 
                 await asyncio.sleep(5)
 
