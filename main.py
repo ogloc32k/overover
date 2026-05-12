@@ -5,18 +5,66 @@ from flask import Flask
 from threading import Thread
 from config import Config
 
-# --- RENDER HEARTBEAT (Keep-Alive) ---
+# --- WEB DASHBOARD & HEARTBEAT ---
 app = Flask('')
+bot_instance = None # Global reference so Flask can read the bot's data
+
 @app.route('/')
-def home(): return "Bot is Online"
+def home():
+    if not bot_instance:
+        return "<body style='background:#121212; color:white; font-family:monospace; padding:20px;'>Bot is starting up... Refresh in a few seconds.</body>"
+    
+    # Calculate values
+    daily_pnl = bot_instance.balance - bot_instance.daily_start_bal
+    lock_status = "🟢 ACTIVE" if not bot_instance.lock_until or datetime.now() >= bot_instance.lock_until else f"🔴 LOCKED UNTIL {bot_instance.lock_until.strftime('%H:%M:%S')}"
+    
+    # Build a clean HTML page
+    html = f"""
+    <html>
+    <head>
+        <title>SniperBot Dashboard</title>
+        <meta http-equiv="refresh" content="2"> <style>
+            body {{ background-color: #0d1117; color: #c9d1d9; font-family: 'Courier New', Courier, monospace; padding: 20px; }}
+            h2 {{ color: #58a6ff; margin-bottom: 5px; }}
+            .stats {{ background: #161b22; padding: 15px; border-radius: 8px; border: 1px solid #30363d; margin-bottom: 20px; font-size: 16px; line-height: 1.6; }}
+            .highlight {{ color: #7ee787; font-weight: bold; }}
+            .warning {{ color: #ff7b72; font-weight: bold; }}
+            .logs-container {{ background: #010409; padding: 15px; border-radius: 8px; border: 1px solid #30363d; height: 400px; overflow-y: auto; }}
+            .log-line {{ margin: 5px 0; border-bottom: 1px dashed #21262d; padding-bottom: 5px; }}
+        </style>
+    </head>
+    <body>
+        <h2>🎯 SniperBot Live Dashboard</h2>
+        <div class="stats">
+            <div>💰 <b>Balance:</b> ${bot_instance.balance:,.2f}</div>
+            <div>📈 <b>Daily P/L:</b> <span class="{'highlight' if daily_pnl >= 0 else 'warning'}">${daily_pnl:+.2f}</span></div>
+            <div>🎯 <b>Mode:</b> {bot_instance.mode}</div>
+            <div>⏱️ <b>Status:</b> {lock_status}</div>
+        </div>
+        
+        <h3>📋 Recent Logs</h3>
+        <div class="logs-container">
+    """
+    
+    # Add logs in reverse so newest is at the top
+    for log in reversed(list(bot_instance.logs)):
+        html += f"<div class='log-line'>{log}</div>"
+        
+    html += """
+        </div>
+    </body>
+    </html>
+    """
+    return html
 
 def run_heartbeat():
-    app.run(host='0.0.0.0', port=10000)
+    app.run(host='0.0.0.0', port=10000, debug=False, use_reloader=False)
 
 def keep_alive():
     t = Thread(target=run_heartbeat)
     t.daemon = True
     t.start()
+
 
 class MarketIntel:
     def __init__(self, symbol):
@@ -50,12 +98,14 @@ class MarketIntel:
 
 class SniperBot:
     def __init__(self):
+        global bot_instance
+        bot_instance = self  # Give Flask access to this specific bot instance
         self.markets = {s: MarketIntel(s) for s in Config.MARKETS.keys()}
         self.balance, self.start_bal, self.peak_bal = 0.0, 0.0, 0.0
         self.daily_start_bal = 0.0
         self.is_trading = False
         self.mode = "DIFFERS" 
-        self.logs = deque(maxlen=10)
+        self.logs = deque(maxlen=20) # Increased to 20 so the web page shows more history
         self.lock_until = None
         self.current_day = datetime.now().date()
 
@@ -114,6 +164,7 @@ class SniperBot:
         await ws.send(json.dumps(payload))
 
     async def dashboard(self):
+        # We keep the terminal dashboard running too, just in case you look at it locally
         while True:
             sys.stdout.write("\033[H")
             stake = self.calculate_stake()
@@ -138,14 +189,15 @@ class SniperBot:
                 signal = "⚪ WAIT"
                 if not self.is_trading and (not self.lock_until or datetime.now() >= self.lock_until):
                     if self.mode == "DIFFERS" and m.last_digit == king and m.prev_digit == king and pcts[king] >= Config.KING_MIN_PCT:
-                        signal = "🎯 DIFFERS"
+                        if slave == 0: signal = "🎯 OVER 0"
+                        elif slave == 9: signal = "🎯 UNDER 9"
+                        else: signal = "🎯 DIFFERS"
                     elif self.mode == "RECOVERY" and m.is_anti_digit(king) and gap >= Config.MIN_GAP_PERCENT and pcts[king] >= Config.KING_MIN_PCT:
                         signal = "🔥 RECOVER"
                 out.append(f"{Config.MARKETS[s]['name']:<10} | {m.last_digit} | "
                            f"{king} ({pcts[king]:.1f}%) | {slave} ({pcts[slave]:.1f}%) | {signal}")
             
-            out.append("━" * 105 + "\n📋 LOGS:")
-            for l in self.logs: out.append(f"   {l}")
+            out.append("━" * 105 + "\n📋 LOGS (Check your Render Web URL for clean view!):")
             sys.stdout.write("\n".join(out) + "\033[J\n")
             await asyncio.sleep(0.4)
 
@@ -221,8 +273,14 @@ class SniperBot:
                                 # 🛡️ Sniping Logic
                                 if self.mode == "DIFFERS":
                                     if m_intel.last_digit == king and m_intel.prev_digit == king and pcts[king] >= Config.KING_MIN_PCT:
-                                        best_market = (s_code, "DIGITDIFF", slave)
+                                        if slave == 0:
+                                            best_market = (s_code, "DIGITOVER", "0")
+                                        elif slave == 9:
+                                            best_market = (s_code, "DIGITUNDER", "9")
+                                        else:
+                                            best_market = (s_code, "DIGITDIFF", str(slave))
                                         break 
+
                                 elif self.mode == "RECOVERY":
                                     if m_intel.is_anti_digit(king) and gap >= Config.MIN_GAP_PERCENT and pcts[king] >= Config.KING_MIN_PCT:
                                         if gap > max_gap:
